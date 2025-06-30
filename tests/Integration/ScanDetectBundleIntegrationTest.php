@@ -28,7 +28,8 @@ class ScanDetectBundleIntegrationTest extends KernelTestCase
         $kernel = self::bootKernel();
 
         // 验证 Bundle 已正确注册
-        $this->assertTrue($kernel->getBundle('ScanDetectBundle') !== null, 'ScanDetectBundle 未正确注册');
+        $bundle = $kernel->getBundle('ScanDetectBundle');
+        $this->assertNotNull($bundle, 'ScanDetectBundle 未正确注册');
 
         // 验证缓存服务是否可用
         $cache = self::getContainer()->get(\Psr\SimpleCache\CacheInterface::class);
