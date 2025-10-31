@@ -1,0 +1,8 @@
+services:
+  # test环境默认配置
+  _defaults:
+    autowire: true
+    autoconfigure: true
+    public: true
+
+  # Cache-based架构无需DataFixtures

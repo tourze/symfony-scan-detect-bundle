@@ -1,321 +1,294 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Tourze\ScanDetectBundle\Tests\EventSubscriber;
 
-use PHPUnit\Framework\TestCase;
-use Psr\SimpleCache\CacheInterface;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RunTestsInSeparateProcesses;
+use PHPUnit\Framework\MockObject\MockObject;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\ExceptionEvent;
 use Symfony\Component\HttpKernel\Event\RequestEvent;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
-use Symfony\Component\HttpKernel\KernelInterface;
+use Tourze\PHPUnitSymfonyKernelTest\AbstractEventSubscriberTestCase;
 use Tourze\ScanDetectBundle\EventSubscriber\ScanDetect404Subscriber;
+use Tourze\ScanDetectBundle\Service\ScanDetectService;
 
 /**
  * ScanDetect404Subscriber 单元测试
  *
- * 测试扫描检测功能，包括请求处理和异常处理
+ * 测试扫描检测404事件订阅器的核心功能：
+ * - 阻止已被标记的恶意IP访问
+ * - 记录404异常并触发IP封禁检查
+ * - 对安全IP的白名单处理
+ *
+ * @internal
  */
-class ScanDetect404SubscriberTest extends TestCase
+#[CoversClass(ScanDetect404Subscriber::class)]
+#[RunTestsInSeparateProcesses]
+final class ScanDetect404SubscriberTest extends AbstractEventSubscriberTestCase
 {
-    private CacheInterface $cache;
     private ScanDetect404Subscriber $subscriber;
-    private KernelInterface $kernel;
-    private ?string $originalEnvValue = null;
 
-    protected function setUp(): void
+    private ScanDetectService&MockObject $scanDetectService;
+
+    private HttpKernelInterface&MockObject $mockKernel;
+
+    protected function onSetUp(): void
     {
-        // 保存原始环境变量值
-        $this->originalEnvValue = $_ENV['SCAN_DETECT_404_FOUND_TIME'] ?? null;
+        $this->scanDetectService = $this->createMock(ScanDetectService::class);
+        $this->mockKernel = $this->createMock(HttpKernelInterface::class);
 
-        // 默认设置扫描检测阈值为20
-        $_ENV['SCAN_DETECT_404_FOUND_TIME'] = 20;
+        // 将Mock服务注入到容器中，以便getService能够返回Mock对象
+        self::getContainer()->set(ScanDetectService::class, $this->scanDetectService);
 
-        // 模拟缓存接口
-        $this->cache = $this->createMock(CacheInterface::class);
-
-        // 创建订阅器实例
-        $this->subscriber = new ScanDetect404Subscriber($this->cache);
-
-        // 模拟内核
-        $this->kernel = $this->createMock(KernelInterface::class);
+        $this->subscriber = self::getService(ScanDetect404Subscriber::class);
     }
 
-    protected function tearDown(): void
+    public function testSubscriberListensToCorrectEvents(): void
     {
-        // 恢复原始环境变量值
-        if ($this->originalEnvValue === null) {
-            unset($_ENV['SCAN_DETECT_404_FOUND_TIME']);
-        } else {
-            $_ENV['SCAN_DETECT_404_FOUND_TIME'] = $this->originalEnvValue;
-        }
+        // 通过反射验证事件监听器属性
+        $reflection = new \ReflectionClass(ScanDetect404Subscriber::class);
+
+        // 检查 onKernelRequest 方法的事件监听器属性
+        $requestMethod = $reflection->getMethod('onKernelRequest');
+        $requestAttributes = $requestMethod->getAttributes();
+        $this->assertNotEmpty($requestAttributes);
+
+        // 检查 onKernelException 方法的事件监听器属性
+        $exceptionMethod = $reflection->getMethod('onKernelException');
+        $exceptionAttributes = $exceptionMethod->getAttributes();
+        $this->assertNotEmpty($exceptionAttributes);
     }
 
-    /**
-     * 测试当maxTime小于等于零时onKernelRequest方法不做任何处理
-     */
-    public function testOnKernelRequest_withMaxTimeLessThanZero(): void
+    public function testOnKernelRequestBlocksIPWhenBlocked(): void
     {
-        // 设置环境变量为0
-        $_ENV['SCAN_DETECT_404_FOUND_TIME'] = 0;
+        $request = $this->createRequestWithIp('192.168.1.100');
+        $event = new RequestEvent($this->mockKernel, $request, HttpKernelInterface::MAIN_REQUEST);
 
-        // 创建请求事件
-        $request = Request::create('https://example.com');
-        $event = $this->createRequestEvent($request);
+        // 模拟IP被封禁
+        $this->scanDetectService
+            ->expects($this->once())
+            ->method('isIPBlocked')
+            ->with('192.168.1.100')
+            ->willReturn(true)
+        ;
 
-        // 缓存不应被调用
-        $this->cache->expects($this->never())
-            ->method('get');
-
-        // 执行测试
         $this->subscriber->onKernelRequest($event);
 
-        // 验证没有响应被设置
-        $this->assertNull($event->getResponse());
-    }
-
-    /**
-     * 测试使用安全IP时onKernelRequest方法不会进行任何检查
-     */
-    public function testOnKernelRequest_withSafeIP(): void
-    {
-        // 创建使用安全IP的请求
-        $request = Request::create('https://example.com');
-        $request->server->set('REMOTE_ADDR', '127.0.0.1');
-        $event = $this->createRequestEvent($request);
-
-        // 缓存不应被调用
-        $this->cache->expects($this->never())
-            ->method('get');
-
-        // 执行测试
-        $this->subscriber->onKernelRequest($event);
-
-        // 验证没有响应被设置
-        $this->assertNull($event->getResponse());
-    }
-
-    /**
-     * 测试当IP被标记为恶意时onKernelRequest方法会返回403响应
-     */
-    public function testOnKernelRequest_withAccessDeniedIP(): void
-    {
-        // 创建请求
-        $request = Request::create('https://example.com');
-        $request->server->set('REMOTE_ADDR', '192.168.1.1');
-        $event = $this->createRequestEvent($request);
-
-        // 模拟缓存返回时间戳，表示IP已被禁止
-        $this->cache->expects($this->once())
-            ->method('get')
-            ->with('ACCESS_DENIED_192.168.1.1')
-            ->willReturn(time());
-
-        // 执行测试
-        $this->subscriber->onKernelRequest($event);
-
-        // 验证是否设置了403响应
+        // 验证响应被设置为403禁止访问
         $response = $event->getResponse();
         $this->assertInstanceOf(Response::class, $response);
-        $this->assertEquals(403, $response->getStatusCode());
-        $this->assertEquals('ScanForbidden', $response->getContent());
+        $this->assertSame(403, $response->getStatusCode());
+        $this->assertSame('ScanForbidden', $response->getContent());
+
+        // 验证事件传播被停止
+        $this->assertTrue($event->isPropagationStopped());
     }
 
-    /**
-     * 测试当IP未被标记为恶意时onKernelRequest方法正常处理请求
-     */
-    public function testOnKernelRequest_withNormalIP(): void
+    public function testOnKernelRequestAllowsIPWhenNotBlocked(): void
     {
-        // 创建请求
-        $request = Request::create('https://example.com');
-        $request->server->set('REMOTE_ADDR', '192.168.1.1');
-        $event = $this->createRequestEvent($request);
+        $request = $this->createRequestWithIp('192.168.1.100');
+        $event = new RequestEvent($this->mockKernel, $request, HttpKernelInterface::MAIN_REQUEST);
 
-        // 模拟缓存返回0，表示IP未被禁止
-        $this->cache->expects($this->once())
-            ->method('get')
-            ->with('ACCESS_DENIED_192.168.1.1')
-            ->willReturn(0);
+        // 模拟IP未被封禁
+        $this->scanDetectService
+            ->expects($this->once())
+            ->method('isIPBlocked')
+            ->with('192.168.1.100')
+            ->willReturn(false)
+        ;
 
-        // 执行测试
         $this->subscriber->onKernelRequest($event);
 
-        // 验证没有响应被设置
+        // 验证没有设置响应
+        $this->assertNull($event->getResponse());
+
+        // 验证事件传播未被停止
+        $this->assertFalse($event->isPropagationStopped());
+    }
+
+    public function testOnKernelRequestIgnoresRequestsWithNoClientIP(): void
+    {
+        $request = $this->createRequestWithIp(null);
+        $event = new RequestEvent($this->mockKernel, $request, HttpKernelInterface::MAIN_REQUEST);
+
+        // 不应该调用任何扫描检测方法
+        $this->scanDetectService
+            ->expects($this->never())
+            ->method('isIPBlocked')
+        ;
+
+        $this->subscriber->onKernelRequest($event);
+
+        // 验证没有设置响应
+        $this->assertNull($event->getResponse());
+
+        // 验证事件传播未被停止
+        $this->assertFalse($event->isPropagationStopped());
+    }
+
+    public function testOnKernelExceptionRecordsScanAttemptForNotFoundHttpException(): void
+    {
+        $request = $this->createRequestWithIp('192.168.1.100');
+        $exception = new NotFoundHttpException('Page not found');
+        $event = new ExceptionEvent($this->mockKernel, $request, HttpKernelInterface::MAIN_REQUEST, $exception);
+
+        // 验证扫描尝试被记录
+        $this->scanDetectService
+            ->expects($this->once())
+            ->method('recordScanAttempt')
+            ->with($request, 404)
+        ;
+
+        // 验证检查并封禁IP被调用
+        $this->scanDetectService
+            ->expects($this->once())
+            ->method('checkAndBlockIP')
+            ->with('192.168.1.100')
+        ;
+
+        $this->subscriber->onKernelException($event);
+    }
+
+    public function testOnKernelExceptionIgnoresNonNotFoundHttpException(): void
+    {
+        $request = $this->createRequestWithIp('192.168.1.100');
+        $exception = new \RuntimeException('Some other error');
+        $event = new ExceptionEvent($this->mockKernel, $request, HttpKernelInterface::MAIN_REQUEST, $exception);
+
+        // 不应该记录扫描尝试
+        $this->scanDetectService
+            ->expects($this->never())
+            ->method('recordScanAttempt')
+        ;
+
+        // 不应该检查IP封禁
+        $this->scanDetectService
+            ->expects($this->never())
+            ->method('checkAndBlockIP')
+        ;
+
+        $this->subscriber->onKernelException($event);
+    }
+
+    public function testOnKernelExceptionIgnoresRequestsWithNoClientIP(): void
+    {
+        $request = $this->createRequestWithIp(null);
+        $exception = new NotFoundHttpException('Page not found');
+        $event = new ExceptionEvent($this->mockKernel, $request, HttpKernelInterface::MAIN_REQUEST, $exception);
+
+        // 不应该记录扫描尝试
+        $this->scanDetectService
+            ->expects($this->never())
+            ->method('recordScanAttempt')
+        ;
+
+        // 不应该检查IP封禁
+        $this->scanDetectService
+            ->expects($this->never())
+            ->method('checkAndBlockIP')
+        ;
+
+        $this->subscriber->onKernelException($event);
+    }
+
+    #[DataProvider('ipAddressProvider')]
+    public function testOnKernelRequestHandlesDifferentIPTypes(?string $ip, bool $shouldCallService): void
+    {
+        $request = $this->createRequestWithIp($ip);
+        $event = new RequestEvent($this->mockKernel, $request, HttpKernelInterface::MAIN_REQUEST);
+
+        if ($shouldCallService) {
+            $this->scanDetectService
+                ->expects($this->once())
+                ->method('isIPBlocked')
+                ->with($ip)
+                ->willReturn(false)
+            ;
+        } else {
+            $this->scanDetectService
+                ->expects($this->never())
+                ->method('isIPBlocked')
+            ;
+        }
+
+        $this->subscriber->onKernelRequest($event);
+
         $this->assertNull($event->getResponse());
     }
 
-    /**
-     * 测试当异常不是NotFoundHttpException时onKernelException方法不进行处理
-     */
-    public function testOnKernelException_withNonNotFoundException(): void
+    #[DataProvider('ipAddressProvider')]
+    public function testOnKernelExceptionHandlesDifferentIPTypes(?string $ip, bool $shouldCallService): void
     {
-        // 创建异常事件，使用非NotFoundHttpException异常
-        $request = Request::create('https://example.com');
-        $exception = new \RuntimeException('一般运行时异常');
-        $event = $this->createExceptionEvent($request, $exception);
+        $request = $this->createRequestWithIp($ip);
+        $exception = new NotFoundHttpException('Page not found');
+        $event = new ExceptionEvent($this->mockKernel, $request, HttpKernelInterface::MAIN_REQUEST, $exception);
 
-        // 缓存不应被调用
-        $this->cache->expects($this->never())
-            ->method('get');
+        if ($shouldCallService) {
+            $this->scanDetectService
+                ->expects($this->once())
+                ->method('recordScanAttempt')
+                ->with($request, 404)
+            ;
 
-        // 执行测试
+            $this->scanDetectService
+                ->expects($this->once())
+                ->method('checkAndBlockIP')
+                ->with($ip)
+            ;
+        } else {
+            $this->scanDetectService
+                ->expects($this->never())
+                ->method('recordScanAttempt')
+            ;
+
+            $this->scanDetectService
+                ->expects($this->never())
+                ->method('checkAndBlockIP')
+            ;
+        }
+
         $this->subscriber->onKernelException($event);
     }
 
     /**
-     * 测试使用安全IP时onKernelException方法不进行处理
+     * @return array<string, array{string|null, bool}>
      */
-    public function testOnKernelException_withSafeIP(): void
+    public static function ipAddressProvider(): array
     {
-        // 创建异常事件，使用安全IP
-        $request = Request::create('https://example.com');
-        $request->server->set('REMOTE_ADDR', '127.0.0.1');
-        $exception = new NotFoundHttpException('页面未找到');
-        $event = $this->createExceptionEvent($request, $exception);
+        return [
+            'valid IPv4' => ['192.168.1.100', true],
+            'valid IPv6' => ['2001:0db8:85a3:0000:0000:8a2e:0370:7334', true],
+            'localhost IPv4' => ['127.0.0.1', true],
+            'localhost IPv6' => ['::1', true],
+            'null IP' => [null, false],
+        ];
+    }
 
-        // 缓存不应被调用
-        $this->cache->expects($this->never())
-            ->method('get');
-
-        // 执行测试
-        $this->subscriber->onKernelException($event);
+    public function testSubscriberCanBeInstantiated(): void
+    {
+        $subscriber = self::getService(ScanDetect404Subscriber::class);
+        $this->assertInstanceOf(ScanDetect404Subscriber::class, $subscriber);
     }
 
     /**
-     * 测试当maxTime小于等于零时onKernelException方法不进行处理
+     * 创建带有指定客户端IP的请求对象
      */
-    public function testOnKernelException_withLowMaxTime(): void
+    private function createRequestWithIp(?string $ip): Request
     {
-        // 设置环境变量为0
-        $_ENV['SCAN_DETECT_404_FOUND_TIME'] = 0;
+        $request = new Request();
 
-        // 创建异常事件
-        $request = Request::create('https://example.com');
-        $request->server->set('REMOTE_ADDR', '192.168.1.1');
-        $exception = new NotFoundHttpException('页面未找到');
-        $event = $this->createExceptionEvent($request, $exception);
+        if (null !== $ip) {
+            // 设置客户端IP，模拟真实请求场景
+            $request->server->set('REMOTE_ADDR', $ip);
+            $request->headers->set('X-Forwarded-For', $ip);
+        }
 
-        // 缓存不应被调用
-        $this->cache->expects($this->never())
-            ->method('get');
-
-        // 执行测试
-        $this->subscriber->onKernelException($event);
-    }
-
-    /**
-     * 测试IP在短时间内触发大量404时会被标记为恶意IP
-     */
-    public function testOnKernelException_withFrequent404s(): void
-    {
-        // 创建异常事件
-        $request = Request::create('https://example.com');
-        $request->server->set('REMOTE_ADDR', '192.168.1.1');
-        $exception = new NotFoundHttpException('页面未找到');
-        $event = $this->createExceptionEvent($request, $exception);
-
-        // 设置环境变量
-        $_ENV['SCAN_DETECT_404_FOUND_TIME'] = 5;
-
-        // 模拟缓存返回超过阈值的计数
-        $this->cache->expects($this->once())
-            ->method('get')
-            ->with('scan_detect_404_192.168.1.1', 0)
-            ->willReturn(6);
-
-        // 使用 at() 方法替代 withConsecutive 
-        $this->cache->expects($this->exactly(2))
-            ->method('set')
-            ->willReturnCallback(function ($key, $value, $ttl = null) {
-                static $callIndex = 0;
-
-                if ($callIndex === 0) {
-                    $this->assertEquals('ACCESS_DENIED_192.168.1.1', $key);
-                    $this->assertIsInt($value);
-                    $this->assertEquals(60 * 5, $ttl);
-                } elseif ($callIndex === 1) {
-                    $this->assertEquals('scan_detect_404_192.168.1.1', $key);
-                    $this->assertEquals(7, $value);
-                    $this->assertEquals(60, $ttl);
-                }
-
-                $callIndex++;
-                return true;
-            });
-
-        // 执行测试
-        $this->subscriber->onKernelException($event);
-    }
-
-    /**
-     * 测试IP触发404但未达到阈值时的计数器更新
-     */
-    public function testOnKernelException_withNonFrequent404s(): void
-    {
-        // 创建异常事件
-        $request = Request::create('https://example.com');
-        $request->server->set('REMOTE_ADDR', '192.168.1.1');
-        $exception = new NotFoundHttpException('页面未找到');
-        $event = $this->createExceptionEvent($request, $exception);
-
-        // 模拟缓存返回未超过阈值的计数
-        $this->cache->expects($this->once())
-            ->method('get')
-            ->with('scan_detect_404_192.168.1.1', 0)
-            ->willReturn(5);
-
-        // 验证只更新计数器而不设置ACCESS_DENIED键
-        $this->cache->expects($this->once())
-            ->method('set')
-            ->with('scan_detect_404_192.168.1.1', 6, 60);
-
-        // 执行测试
-        $this->subscriber->onKernelException($event);
-    }
-
-    /**
-     * 测试当scanDetectKey为null时onKernelException不进行处理
-     */
-    public function testOnKernelException_withNullIP(): void
-    {
-        // 创建异常事件，IP为null
-        $request = Request::create('https://example.com');
-        $request->server->remove('REMOTE_ADDR');
-        $exception = new NotFoundHttpException('页面未找到');
-        $event = $this->createExceptionEvent($request, $exception);
-
-        // 缓存的get不应被调用
-        $this->cache->expects($this->never())
-            ->method('get');
-
-        // 执行测试
-        $this->subscriber->onKernelException($event);
-    }
-
-    /**
-     * 创建请求事件对象
-     */
-    private function createRequestEvent(Request $request): RequestEvent
-    {
-        return new RequestEvent(
-            $this->kernel,
-            $request,
-            HttpKernelInterface::MAIN_REQUEST
-        );
-    }
-
-    /**
-     * 创建异常事件对象
-     */
-    private function createExceptionEvent(Request $request, \Throwable $exception): ExceptionEvent
-    {
-        return new ExceptionEvent(
-            $this->kernel,
-            $request,
-            HttpKernelInterface::MAIN_REQUEST,
-            $exception
-        );
+        return $request;
     }
 }

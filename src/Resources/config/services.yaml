@@ -5,5 +5,21 @@ services:
     autoconfigure: true # Automatically registers your services as commands, event subscribers, etc.
     public: false
 
+  # PSR-16 Cache Interface - Core dependency for Cache-based architecture
+  Psr\SimpleCache\CacheInterface:
+    class: Symfony\Component\Cache\Psr16Cache
+    arguments:
+      - '@cache.app'
+
+  # Auto-register EventSubscriber - Core 404 detection logic
   Tourze\ScanDetectBundle\EventSubscriber\:
     resource: '../../EventSubscriber/'
+
+  # Auto-register Service - Simplified Cache-based scan detection
+  Tourze\ScanDetectBundle\Service\:
+    resource: '../../Service/'
+
+  # Auto-register Command - Simplified cache management
+  Tourze\ScanDetectBundle\Command\:
+    resource: '../../Command/'
+    tags: ['console.command']
