@@ -6,7 +6,7 @@ namespace Tourze\ScanDetectBundle\DependencyInjection;
 
 use Tourze\SymfonyDependencyServiceLoader\AutoExtension;
 
-class ScanDetectExtension extends AutoExtension
+final class ScanDetectExtension extends AutoExtension
 {
     protected function getConfigDir(): string
     {
